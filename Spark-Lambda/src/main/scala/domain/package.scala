@@ -1,5 +1,5 @@
 /**
-  * Created by Ahmad Alkilani on 5/1/2016.
+  * Created by Omkar on 9/10/2016.
   */
 package object domain {
     case class Activity(timestamp_hour: Long,
