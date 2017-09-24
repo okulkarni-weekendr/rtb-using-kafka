@@ -1,9 +1,11 @@
 package streaming
 
-import domain.{Activity, ActivityByProduct}
+import com.twitter.algebird.HyperLogLogMonoid
+import domain.{Activity, ActivityByProduct, VisitorsByProduct}
 import org.apache.spark.SparkContext
 import org.apache.spark.streaming._
 import utils.SparkUtils._
+import functions._
 
 object StreamingJob {
 	def main(args: Array[String]): Unit = {
@@ -17,9 +19,10 @@ object StreamingJob {
 		def streamingApp(sc: SparkContext, batchDuration: Duration) = {
 			val ssc = new StreamingContext(sc, batchDuration)
 
-			val inputPath = isIDE match {
-				case true => "file:////Users/omkar/workspace/spark-kafka-cassandra-applying-lambda-architecture/vagrant/input"
-				case false => "file:///vagrant/input"
+			val inputPath = if (isIDE) {
+				"file:////Users/omkar/workspace/spark-kafka-cassandra-applying-lambda-architecture/vagrant/input"
+			} else {
+				"file:///vagrant/input"
 			}
 
 			val textDStream = ssc.textFileStream(inputPath)
@@ -32,9 +35,14 @@ object StreamingJob {
 					else
 						None
 				}
-			})
+			}).cache()
 
-			activityStream.transform(rdd => {
+			val activityStateSpec =
+				StateSpec
+					.function(mapActivityStateFunc)
+					.timeout(Minutes(120))
+
+			val stateFulActivityByProduct = activityStream.transform(rdd => {
 				val df = rdd.toDF()
 				df.registerTempTable("activity")
 				val activityByProduct = sqlContext.sql("""SELECT
@@ -49,7 +57,40 @@ object StreamingJob {
 					.map { r => ((r.getString(0), r.getLong(1)),
 						ActivityByProduct(r.getString(0), r.getLong(1), r.getLong(2), r.getLong(3), r.getLong(4))
 					) }
-			} ).print()
+			} ).mapWithState(activityStateSpec)
+
+			//Go through the slides again for the info
+			val activityStateSnapshot = stateFulActivityByProduct.stateSnapshots()
+			activityStateSnapshot
+			    	.reduceByKeyAndWindow(
+						(a,b) => b,
+						(x,y) => x,
+						Seconds(30/4*4)
+					)
+		    	.foreachRDD(rdd => rdd.map(sr => ActivityByProduct(sr._1._1, sr._1._2, sr._2._1, sr._2._2, sr._2._3))
+				    	.toDF().registerTempTable("ActivityByproduct"))
+
+			//visitor state spec
+			val visitorStateSpec =
+				StateSpec
+		    	.function(mapVisitorsStateFunc)
+		    	.timeout(Minutes(120))
+
+			val hll = new HyperLogLogMonoid(12)
+
+			val statefulVisitorsByProduct = activityStream.map(a => {
+				((a.product, a.timestamp_hour), hll(a.visitor.getBytes))
+			}).mapWithState(visitorStateSpec)
+
+			val visitorStateSnapshot = statefulVisitorsByProduct.stateSnapshots()
+			visitorStateSnapshot
+			    	.reduceByKeyAndWindow(
+						(a,b) => b,
+						(x, y) => x,
+						Seconds(30/4*4)
+					)//only save or expose the snapshot every x seconds. it will help keep the latest value as it progresses
+				.foreachRDD(rdd => rdd.map(sr => VisitorsByProduct(sr._1._1, sr._1._2, sr._2.approximateSize.estimate))
+		    	.toDF().registerTempTable("VisitorsByProduct")) // foreach will run only every 28 seconds
 
 			ssc
 		}

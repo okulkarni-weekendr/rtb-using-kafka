@@ -7,9 +7,6 @@ import org.apache.commons.io.FileUtils
 
 import scala.util.Random
 
-/**
-  * Created by Ahmad Alkilani on 4/30/2016.
-  */
 object LogProducer extends App {
   // WebLog config
   val wlc = Settings.WebLogGen
