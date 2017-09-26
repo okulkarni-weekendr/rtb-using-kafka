@@ -37,13 +37,13 @@ object SparkUtils {
 		sqlContext
 	}
 
-	def getStreamingContext(streamingApp : (SparkContext, Duration) => StreamingContext, sc : SparkContext, batchDuration: Duration) = {
+	def getStreamingContext(streamingApp: (SparkContext, Duration) => StreamingContext, sc: SparkContext, batchDuration: Duration): Unit ={
 		val creatingFunc = () => streamingApp(sc, batchDuration)
 		val ssc = sc.getCheckpointDir match {
 			case Some(checkpointDir) => StreamingContext.getActiveOrCreate(checkpointDir, creatingFunc, sc.hadoopConfiguration, createOnError = true)
-			case None => StreamingContext.getActiveOrCreate(creatingFunc)
+				case None => StreamingContext.getActiveOrCreate(creatingFunc)
 		}
-		sc.getCheckpointDir.foreach( cp => ssc.checkpoint(cp))
+		sc.getCheckpointDir.foreach(cp => ssc.checkpoint(cp))
 		ssc
 	}
 }

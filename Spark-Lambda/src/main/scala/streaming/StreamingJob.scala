@@ -1,11 +1,17 @@
 package streaming
 
+import _root_.kafka.serializer.StringDecoder
 import com.twitter.algebird.HyperLogLogMonoid
-import domain.{Activity, ActivityByProduct, VisitorsByProduct}
-import org.apache.spark.SparkContext
-import org.apache.spark.streaming._
-import utils.SparkUtils._
+import config.Settings
+import domain.{ActivityByProduct, VisitorsByProduct}
 import functions._
+import kafka.common.TopicAndPartition
+import org.apache.spark.SparkContext
+import org.apache.spark.sql.SaveMode
+import org.apache.spark.sql.functions.max
+import org.apache.spark.streaming._
+import org.apache.spark.streaming.kafka.KafkaUtils
+import utils.SparkUtils._
 
 object StreamingJob {
 	def main(args: Array[String]): Unit = {
@@ -18,24 +24,88 @@ object StreamingJob {
 
 		def streamingApp(sc: SparkContext, batchDuration: Duration) = {
 			val ssc = new StreamingContext(sc, batchDuration)
+			val wlc = Settings.WebLogGen
+			val topic = wlc.kafkaTopic
 
-			val inputPath = if (isIDE) {
-				"file:////Users/omkar/workspace/spark-kafka-cassandra-applying-lambda-architecture/vagrant/input"
-			} else {
-				"file:///vagrant/input"
+			/**
+			  * Receiver based approach
+			  * val kafkaParams = Map(
+				"zookeeper.connect" -> "localhost:2181",
+				"group.id" -> "lambda",
+				"auto.offset.reset" -> "largest")
+			  */
+
+
+			/**
+			  *val kafkaStream = KafkaUtils.createStream[String, String, StringDecoder, StringDecoder](
+				ssc, kafkaParams, Map(topic -> 1), StorageLevel.MEMORY_AND_DISK)
+		    	.map(_._2)
+			  **/
+
+			//driver based approach
+			val kafkaDirectParams = Map(
+				"metadata.broker.list" -> "localhost:9092",
+				"group.id" -> "lambda",
+				"auto.offset.reset" -> "smallest" //check this again
+			)
+
+			//to store offsets in hdfs
+			val hdfsPath = wlc.hdfsPath
+			val hdfsData = sqlContext.read.parquet(hdfsPath)
+
+			//.collect() gives back row object
+			val fromOffsets = hdfsData.groupBy("topic", "kafkaPartition").agg(max("untilOffset").as("untilOffset"))
+				.collect().map{ row =>
+				(TopicAndPartition(row.getAs[String]("topic"), row.getAs[Int]("kafkaPartition")), row.getAs[String]("untilOffset").toLong + 1)
+			}.toMap
+			/**
+			  * the conversion to offset ranges has to be first thing to happen
+			  * Hence, it needs to be done before applying map
+			  */
+
+			/**
+			  * we are going to send a (k,v) pair of topic, data
+			  * and accordingly map it to spark partition based on offsetRange
+			  * TODO: go through this again
+			  */
+			val kafkaDirectStream = fromOffsets.isEmpty match {
+				case true =>
+					KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](
+						ssc, kafkaDirectParams, Set(topic))
+					case false =>
+						KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder, (String, String) ](
+							ssc, kafkaDirectParams, fromOffsets, {mmd => (mmd.key(), mmd.message()) }
+						)
 			}
 
-			val textDStream = ssc.textFileStream(inputPath)
-			val activityStream = textDStream.transform(input => {
-				input.flatMap { line =>
-					val record = line.split("\\t")
-					val MS_IN_HOUR = 1000 * 60 * 60
-					if (record.length == 7)
-						Some(Activity(record(0).toLong / MS_IN_HOUR * MS_IN_HOUR, record(1), record(2), record(3), record(4), record(5), record(6)))
-					else
-						None
-				}
+
+			val activityStream = kafkaDirectStream.transform(input => {
+				functions.rddToRDDActivity(input)
 			}).cache()
+
+			//we are going to fork the data pipeline here, one for batch and one for speed layer
+			/**
+			  * we are going to convert activity stream to DF store it on HDFS
+			  */
+
+			/**
+			  * selectExpr can help add some code for every column
+			  */
+
+			//this is batch process. This needs to be in different application.
+			//Use kafka connect to connect it to hadoop
+			activityStream.foreachRDD{ rdd => {
+				val activityDF = rdd
+					.toDF()
+			    	.selectExpr("timestamp_hour", "referrer", "action", "prevPage", "page", "visitor", "product",
+						"inputProps.topic as topic", "inputProps.kafkaPartition as kafkaPartition",
+						"inputProps.fromOffset as fromOffset", "inputProps.untilOffset as untilOffset")
+				activityDF
+					.write
+					.partitionBy("topic", "kafkaPartition", "timestamp_hour")
+			    	.mode(SaveMode.Append)
+			    	.parquet("hdfs://lambda-pluralsight:9000/lambda/weblogs-app1/")
+			}}
 
 			val activityStateSpec =
 				StateSpec
